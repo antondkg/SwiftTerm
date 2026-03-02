@@ -927,6 +927,46 @@ extension TerminalView {
         currentContext.restoreGState()
     }
 
+    private func runNeedsCellClipping(font: TTFont, glyphs: [CGGlyph]) -> Bool {
+        guard !glyphs.isEmpty else {
+            return false
+        }
+
+        var glyphsCopy = glyphs
+        var bounds = Array(repeating: CGRect.zero, count: glyphsCopy.count)
+        var advances = Array(repeating: CGSize.zero, count: glyphsCopy.count)
+        let epsilon: CGFloat = 0.01
+
+        let ctFont = font as CTFont
+        CTFontGetBoundingRectsForGlyphs(ctFont, .horizontal, &glyphsCopy, &bounds, glyphsCopy.count)
+        CTFontGetAdvancesForGlyphs(ctFont, .horizontal, &glyphsCopy, &advances, glyphsCopy.count)
+
+        for i in glyphsCopy.indices {
+            let leftOverhang = -bounds[i].minX
+            let rightOverhang = bounds[i].maxX - advances[i].width
+            if leftOverhang > epsilon || rightOverhang > epsilon {
+                return true
+            }
+        }
+        return false
+    }
+
+    // Box-drawing and divider characters (for example tmux pane borders)
+    // are especially sensitive to subpixel bleed at cell boundaries.
+    // Force strict per-cell clipping for these runs.
+    private func runUsesBoundarySensitiveGlyphs(_ text: String) -> Bool {
+        guard !text.isEmpty else {
+            return false
+        }
+        for scalar in text.unicodeScalars {
+            let value = scalar.value
+            if (0x2500...0x259F).contains(value) || value == 0x007C {
+                return true
+            }
+        }
+        return false
+    }
+
     private func alignToPixel(_ value: CGFloat, scale: CGFloat, rule: FloatingPointRoundingRule) -> CGFloat {
         guard scale > 0 else {
             return value
@@ -1150,12 +1190,13 @@ extension TerminalView {
             }
 
             // Pre-create CTLines and runs once per row to avoid duplicate creation
-            let preparedSegments: [(segment: ViewLineSegment, ctLine: CTLine, runs: [CTRun])] =
+            let preparedSegments: [(segment: ViewLineSegment, ctLine: CTLine, runs: [CTRun], forceCellClipping: Bool)] =
                 lineInfo.segments.compactMap { segment in
                     guard segment.attributedString.length > 0 else { return nil }
                     let ctLine = CTLineCreateWithAttributedString(segment.attributedString)
                     guard let runs = CTLineGetGlyphRuns(ctLine) as? [CTRun] else { return nil }
-                    return (segment, ctLine, runs)
+                    let forceCellClipping = runUsesBoundarySensitiveGlyphs(segment.attributedString.string)
+                    return (segment, ctLine, runs, forceCellClipping)
                 }
 
             // Background fill loop — uses cached CTLines
@@ -1287,7 +1328,38 @@ extension TerminalView {
                         context.setFillColor(cgColor)
                     }
 
-                    CTFontDrawGlyphs(runFont, runGlyphs, &positions, positions.count, context)
+                    if prepared.forceCellClipping || runNeedsCellClipping(font: runFont, glyphs: runGlyphs) {
+                        if prepared.forceCellClipping {
+                            context.saveGState()
+                            context.setShouldAntialias(false)
+                            context.setAllowsAntialiasing(false)
+                            #if os(macOS)
+                            context.setShouldSmoothFonts(false)
+                            context.setAllowsFontSmoothing(false)
+                            #endif
+                        }
+                        for i in 0..<runGlyphsCount {
+                            let glyphColumn = startColumn + (i * prepared.segment.columnWidth)
+                            let glyphCellRect = CGRect(
+                                x: lineOrigin.x + CGFloat(glyphColumn) * cellDimension.width,
+                                y: lineOrigin.y,
+                                width: CGFloat(prepared.segment.columnWidth) * cellDimension.width,
+                                height: cellDimension.height
+                            )
+
+                            var glyph = runGlyphs[i]
+                            var glyphPosition = positions[i]
+                            context.saveGState()
+                            context.clip(to: glyphCellRect)
+                            CTFontDrawGlyphs(runFont, &glyph, &glyphPosition, 1, context)
+                            context.restoreGState()
+                        }
+                        if prepared.forceCellClipping {
+                            context.restoreGState()
+                        }
+                    } else {
+                        CTFontDrawGlyphs(runFont, runGlyphs, &positions, positions.count, context)
+                    }
 
                     // Draw other attributes
                     drawRunAttributes(runAttributes, glyphPositions: positions, in: context)
