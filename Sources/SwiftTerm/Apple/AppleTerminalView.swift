@@ -784,6 +784,30 @@ extension TerminalView {
         currentContext.restoreGState()
     }
 
+    private func runNeedsCellClipping(font: TTFont, glyphs: [CGGlyph]) -> Bool {
+        guard !glyphs.isEmpty else {
+            return false
+        }
+
+        var glyphsCopy = glyphs
+        var bounds = Array(repeating: CGRect.zero, count: glyphsCopy.count)
+        var advances = Array(repeating: CGSize.zero, count: glyphsCopy.count)
+        let epsilon: CGFloat = 0.01
+
+        let ctFont = font as CTFont
+        CTFontGetBoundingRectsForGlyphs(ctFont, .horizontal, &glyphsCopy, &bounds, glyphsCopy.count)
+        CTFontGetAdvancesForGlyphs(ctFont, .horizontal, &glyphsCopy, &advances, glyphsCopy.count)
+
+        for i in glyphsCopy.indices {
+            let leftOverhang = -bounds[i].minX
+            let rightOverhang = bounds[i].maxX - advances[i].width
+            if leftOverhang > epsilon || rightOverhang > epsilon {
+                return true
+            }
+        }
+        return false
+    }
+
     private func alignToPixel(_ value: CGFloat, scale: CGFloat, rule: FloatingPointRoundingRule) -> CGFloat {
         guard scale > 0 else {
             return value
@@ -1144,7 +1168,26 @@ extension TerminalView {
                         context.setFillColor(cgColor)
                     }
 
-                    CTFontDrawGlyphs(runFont, runGlyphs, &positions, positions.count, context)
+                    if runNeedsCellClipping(font: runFont, glyphs: runGlyphs) {
+                        for i in 0..<runGlyphsCount {
+                            let glyphColumn = startColumn + (i * prepared.segment.columnWidth)
+                            let glyphCellRect = CGRect(
+                                x: lineOrigin.x + CGFloat(glyphColumn) * cellDimension.width,
+                                y: lineOrigin.y,
+                                width: CGFloat(prepared.segment.columnWidth) * cellDimension.width,
+                                height: cellDimension.height
+                            )
+
+                            var glyph = runGlyphs[i]
+                            var glyphPosition = positions[i]
+                            context.saveGState()
+                            context.clip(to: glyphCellRect)
+                            CTFontDrawGlyphs(runFont, &glyph, &glyphPosition, 1, context)
+                            context.restoreGState()
+                        }
+                    } else {
+                        CTFontDrawGlyphs(runFont, runGlyphs, &positions, positions.count, context)
+                    }
 
                     // Draw other attributes
                     drawRunAttributes(runAttributes, glyphPositions: positions, in: context)
